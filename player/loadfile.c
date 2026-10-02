@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <errno.h>
 #include <time.h>
 
 #include <libavutil/avutil.h>
@@ -1265,6 +1266,7 @@ static MP_THREAD_VOID open_demux_thread(void *ctx)
     struct MPContext *mpctx = ctx;
 
     mp_thread_set_name("opener");
+    MP_VERBOSE(mpctx, "Opener thread entered: %s\n", mpctx->open_url);
 
     struct demuxer_params p = {
         .force_format = mpctx->open_format,
@@ -1346,6 +1348,7 @@ static void start_open(struct MPContext *mpctx, char *url, int url_flags,
     mpctx->demuxer_changed = false;
 
     if (mp_thread_create(&mpctx->open_thread, open_demux_thread, mpctx)) {
+        MP_ERR(mpctx, "Failed to create opener thread (errno=%d).\n", errno);
         cancel_open(mpctx);
         return;
     }
@@ -1394,12 +1397,17 @@ static void open_demux_reentrant(struct MPContext *mpctx)
     // User abort should cancel the opener now.
     mp_cancel_set_parent(mpctx->open_cancel, mpctx->playback_abort);
 
+    int64_t wait_start = mp_time_ns();
+    MP_INFO(mpctx, "Waiting for opener to finish: %s\n", url);
     while (!atomic_load(&mpctx->open_done)) {
         mp_idle(mpctx);
 
         if (mpctx->stop_play)
             mp_abort_playback_async(mpctx);
     }
+    MP_INFO(mpctx, "Opener wait finished (%.3fs, demuxer=%s).\n",
+            (mp_time_ns() - wait_start) / 1e9,
+            mpctx->open_res_demuxer ? "ok" : "failed");
 
     if (mpctx->open_res_demuxer) {
         mpctx->demuxer = mpctx->open_res_demuxer;
