@@ -16,6 +16,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -1248,8 +1249,14 @@ void demux_start_thread(struct demuxer *demuxer)
 
     if (!in->threading) {
         in->threading = true;
-        if (mp_thread_create(&in->thread, demux_thread, in))
+        if (mp_thread_create(&in->thread, demux_thread, in)) {
             in->threading = false;
+            MP_ERR(in, "Failed to create demuxer thread (errno=%d).\n", errno);
+        } else {
+            MP_VERBOSE(in, "Demuxer thread created.\n");
+        }
+    } else {
+        MP_VERBOSE(in, "Demuxer thread already running.\n");
     }
 }
 
@@ -1259,11 +1266,13 @@ void demux_stop_thread(struct demuxer *demuxer)
     mp_assert(demuxer == in->d_user);
 
     if (in->threading) {
+        MP_VERBOSE(in, "Stopping demuxer thread...\n");
         mp_mutex_lock(&in->lock);
         in->thread_terminate = true;
         mp_cond_signal(&in->wakeup);
         mp_mutex_unlock(&in->lock);
         mp_thread_join(in->thread);
+        MP_VERBOSE(in, "Demuxer thread joined.\n");
         in->threading = false;
         in->thread_terminate = false;
     }
@@ -2756,6 +2765,7 @@ static MP_THREAD_VOID demux_thread(void *pctx)
 {
     struct demux_internal *in = pctx;
     mp_thread_set_name("demux");
+    MP_VERBOSE(in, "Demuxer thread entered.\n");
     mp_mutex_lock(&in->lock);
 
     stats_register_thread_cputime(in->stats, "thread");
@@ -2766,6 +2776,9 @@ static MP_THREAD_VOID demux_thread(void *pctx)
         mp_cond_signal(&in->wakeup);
         mp_cond_timedwait_until(&in->wakeup, &in->lock, in->next_cache_update);
     }
+
+    MP_VERBOSE(in, "Demuxer thread exiting (shutdown_async=%d).\n",
+               in->shutdown_async);
 
     if (in->shutdown_async) {
         mp_mutex_unlock(&in->lock);
