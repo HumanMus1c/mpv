@@ -463,8 +463,18 @@ static void write_msg_to_buffers(struct mp_log *log, int lev, bstr text)
                     mp_mutex_unlock(&buffer->lock);
                     mp_mutex_lock(&root->log_file_lock);
                     if (root->log_file_thread_active) {
-                        mp_cond_wait(&root->log_file_wakeup,
-                                          &root->log_file_lock);
+                        // The full-buffer test runs under buffer->lock, but the
+                        // writer broadcasts under log_file_lock after consuming,
+                        // so a caller delayed between testing and waiting can
+                        // miss the wakeup while the buffer stays non-full. This
+                        // waiter holds the global log lock across the whole
+                        // loop; a permanent sleep here would deadlock logging
+                        // (and with it every mpv thread) for the process. Use a
+                        // timed wait so a missed wakeup self-heals; the while
+                        // condition rechecks the buffer on every wakeup.
+                        mp_cond_timedwait(&root->log_file_wakeup,
+                                          &root->log_file_lock,
+                                          MP_TIME_MS_TO_NS(200));
                     } else {
                         dead = true;
                     }
