@@ -6481,6 +6481,14 @@ static void cmd_loadfile(void *p)
 
     struct load_action action = get_load_action(mpctx, action_flag);
 
+    // DIAGNOSTICS (humanmus1c): pair with input.c's "command queued" and
+    // demux.c's "Demuxer thread created" - if this runs but the demuxer
+    // thread never appears, demux_start_thread() silently failed; if this
+    // never runs while the client logged a queued command, the core never
+    // processed the command (dispatch wakeup loss).
+    MP_VERBOSE(mpctx, "DIAG: loadfile cmd executing: %s (action=%d)\n",
+               filename, action_flag);
+
     if (action.type == LOAD_TYPE_REPLACE)
         playlist_clear(mpctx->playlist);
 

@@ -58,15 +58,29 @@ void mp_wait_events(struct MPContext *mpctx)
     stats_event(mpctx->stats, "iterations");
 
     bool sleeping = mpctx->sleeptime > 0;
+    // DIAGNOSTICS (humanmus1c): an infinite sleeptime is the state in which
+    // the core waits indefinitely for someone to call mp_wakeup_core(). If a
+    // client command was queued but this sleep never returns, the wakeup was
+    // lost between the client and the dispatch layer.
+    bool inf_sleep = mpctx->sleeptime == INFINITY;
+    if (inf_sleep)
+        MP_WARN(mpctx, "DIAG: core sleep enter timeout=INF\n");
     if (sleeping)
         MP_STATS(mpctx, "start sleep");
 
+    int64_t diag_t0 = mp_time_ns();
     mp_dispatch_queue_process(mpctx->dispatch, mpctx->sleeptime);
 
     mpctx->sleeptime = INFINITY;
 
     if (sleeping)
         MP_STATS(mpctx, "end sleep");
+    // DIAGNOSTICS: an INF sleep must return once a wakeup arrives; if the
+    // paired "sleep INF returned" line is missing after a queued command,
+    // the wakeup never reached this dispatch queue.
+    if (inf_sleep)
+        MP_WARN(mpctx, "DIAG: core sleep INF returned after %.3f ms\n",
+                (mp_time_ns() - diag_t0) / 1e6);
 }
 
 // Set the timeout used when the playloop goes to sleep. This means the

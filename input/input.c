@@ -1343,6 +1343,10 @@ int mp_input_queue_cmd(struct input_ctx *ictx, mp_cmd_t *cmd)
 {
     if (!cmd)
         return 0;
+    // DIAGNOSTICS (humanmus1c): pair with command.c's "loadfile cmd
+    // executing" - a queued command whose executing line never appears means
+    // the core never processed the command.
+    MP_VERBOSE(ictx, "DIAG: command queued: %s\n", cmd->name);
     input_lock(ictx);
     queue_cmd(ictx, cmd);
     input_unlock(ictx);
