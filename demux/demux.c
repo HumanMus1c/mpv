@@ -3611,7 +3611,13 @@ static struct demuxer *open_given_type(struct mpv_global *global,
     }
 
     in->d_thread->params = params; // temporary during open()
+    // DIAGNOSTICS (humanmus1c): the opener hang (2026-10-07) went silent in
+    // the middle of the mkv header/track enumeration. Pair the demuxer open
+    // entry/exit with demux_start_thread()'s creation logs so a wedged open
+    // localizes to before/inside/after the demuxer's own open().
+    mp_verbose(log, "DIAG: demuxer open enter: %s\n", desc->name);
     int ret = demuxer->desc->open(in->d_thread, check);
+    mp_verbose(log, "DIAG: demuxer open returned: %s (ret=%d)\n", desc->name, ret);
     if (ret >= 0) {
         in->d_thread->params = NULL;
         if (in->d_thread->filetype)
