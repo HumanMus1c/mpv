@@ -299,6 +299,7 @@ struct MPContext *mp_create(void)
     // Nothing must call mp_msg*() and related before this
     mp_msg_init(mpctx->global);
     mpctx->log = mp_log_new(mpctx, mpctx->global->log, "!cplayer");
+    mp_dispatch_set_log(mpctx->dispatch, mpctx->log);
     mpctx->statusline = mp_log_new(mpctx, mpctx->log, "!statusline");
 
     mpctx->stats = stats_ctx_create(mpctx, mpctx->global, "main");

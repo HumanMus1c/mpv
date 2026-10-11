@@ -19,6 +19,7 @@
 #include <assert.h>
 
 #include "common/common.h"
+#include "common/msg.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 
@@ -49,6 +50,11 @@ struct mp_dispatch_queue {
     // locked==true is due to a mp_dispatch_lock() call (for debugging).
     bool locked_explicit;
     mp_thread_id locked_explicit_thread_id;
+    // DIAGNOSTICS (humanmus1c): thread currently holding queue->lock, and a
+    // log sink. With a full-memory dump these turn "nobody seems to hold the
+    // lock" into an exact owner TID plus its stack.
+    mp_thread_id diag_locked_by;
+    struct mp_log *log;
 };
 
 struct mp_dispatch_item {
@@ -90,6 +96,13 @@ struct mp_dispatch_queue *mp_dispatch_create(void *ta_parent)
     return queue;
 }
 
+// DIAGNOSTICS (humanmus1c): attach a log sink for the dispatch-level hang
+// forensics. Call once after the player log exists.
+void mp_dispatch_set_log(struct mp_dispatch_queue *queue, struct mp_log *log)
+{
+    queue->log = log;
+}
+
 // Set a custom function that should be called to guarantee that the target
 // thread wakes up. This is intended for use with code that needs to block
 // on non-pthread primitives, such as e.g. poll(). In the case of poll(),
@@ -127,13 +140,15 @@ static void mp_dispatch_append(struct mp_dispatch_queue *queue,
                                struct mp_dispatch_item *item)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     if (item->mergeable) {
         for (struct mp_dispatch_item *cur = queue->head; cur; cur = cur->next) {
             if (cur->mergeable && cur->fn == item->fn &&
                 cur->fn_data == item->fn_data)
             {
                 talloc_free(item);
-                mp_mutex_unlock(&queue->lock);
+                queue->diag_locked_by = 0;
+    mp_mutex_unlock(&queue->lock);
                 return;
             }
         }
@@ -153,6 +168,7 @@ static void mp_dispatch_append(struct mp_dispatch_queue *queue,
     // interrupted instead.
     if (!queue->wakeup_fn)
         queue->interrupted = true;
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 
     if (queue->wakeup_fn)
@@ -219,6 +235,7 @@ void mp_dispatch_cancel_fn(struct mp_dispatch_queue *queue,
                            mp_dispatch_fn fn, void *fn_data)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     struct mp_dispatch_item **pcur = &queue->head;
     queue->tail = NULL;
     while (*pcur) {
@@ -231,6 +248,7 @@ void mp_dispatch_cancel_fn(struct mp_dispatch_queue *queue,
             pcur = &cur->next;
         }
     }
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 }
 
@@ -247,10 +265,16 @@ void mp_dispatch_run(struct mp_dispatch_queue *queue,
     };
     mp_dispatch_append(queue, &item);
 
-    mp_mutex_lock(&queue->lock);
+    if (queue->log)
+        mp_verbose(queue->log, "DIAG: dispatch_run enter" );
+mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     while (!item.completed)
         mp_cond_wait(&queue->cond, &queue->lock);
-    mp_mutex_unlock(&queue->lock);
+    queue->diag_locked_by = 0;
+    if (queue->log)
+        mp_verbose(queue->log, "DIAG: dispatch_run exit");
+mp_mutex_unlock(&queue->lock);
 }
 
 // Process any outstanding dispatch items in the queue. This also handles
@@ -272,6 +296,7 @@ void mp_dispatch_run(struct mp_dispatch_queue *queue,
 void mp_dispatch_queue_process(struct mp_dispatch_queue *queue, double timeout)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     queue->wait = timeout > 0 ? mp_time_ns_add(mp_time_ns(), timeout) : 0;
     mp_assert(!queue->in_process); // recursion not allowed
     queue->in_process = true;
@@ -295,11 +320,13 @@ void mp_dispatch_queue_process(struct mp_dispatch_queue *queue, double timeout)
             // from mp_dispatch_lock(), which is done by locked=true.
             mp_assert(!queue->locked);
             queue->locked = true;
-            mp_mutex_unlock(&queue->lock);
+            queue->diag_locked_by = 0;
+    mp_mutex_unlock(&queue->lock);
 
             item->fn(item->fn_data);
 
             mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
             mp_assert(queue->locked);
             queue->locked = false;
             // Wakeup mp_dispatch_run(), also mp_dispatch_lock().
@@ -319,6 +346,7 @@ void mp_dispatch_queue_process(struct mp_dispatch_queue *queue, double timeout)
     mp_assert(!queue->locked);
     queue->in_process = false;
     queue->interrupted = false;
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 }
 
@@ -331,8 +359,10 @@ void mp_dispatch_queue_process(struct mp_dispatch_queue *queue, double timeout)
 void mp_dispatch_interrupt(struct mp_dispatch_queue *queue)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     queue->interrupted = true;
     mp_cond_broadcast(&queue->cond);
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 }
 
@@ -347,10 +377,12 @@ void mp_dispatch_interrupt(struct mp_dispatch_queue *queue)
 void mp_dispatch_adjust_timeout(struct mp_dispatch_queue *queue, int64_t until)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     if (queue->in_process && queue->wait > until) {
         queue->wait = until;
         mp_cond_broadcast(&queue->cond);
     }
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 }
 
@@ -364,6 +396,7 @@ void mp_dispatch_adjust_timeout(struct mp_dispatch_queue *queue, int64_t until)
 void mp_dispatch_lock(struct mp_dispatch_queue *queue)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     // Must not be called recursively from dispatched callbacks.
     if (queue->in_process)
         mp_assert(!mp_thread_id_equal(queue->in_process_thread_id, mp_thread_current_id()));
@@ -377,10 +410,12 @@ void mp_dispatch_lock(struct mp_dispatch_queue *queue)
     if (queue->onlock_fn)
         queue->onlock_fn(queue->onlock_ctx);
     while (!queue->in_process) {
-        mp_mutex_unlock(&queue->lock);
+        queue->diag_locked_by = 0;
+    mp_mutex_unlock(&queue->lock);
         if (queue->wakeup_fn)
             queue->wakeup_fn(queue->wakeup_ctx);
         mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
         if (queue->in_process)
             break;
         mp_cond_wait(&queue->cond, &queue->lock);
@@ -395,6 +430,7 @@ void mp_dispatch_lock(struct mp_dispatch_queue *queue)
     queue->locked = true;
     queue->locked_explicit = true;
     queue->locked_explicit_thread_id = mp_thread_current_id();
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 }
 
@@ -402,6 +438,7 @@ void mp_dispatch_lock(struct mp_dispatch_queue *queue)
 void mp_dispatch_unlock(struct mp_dispatch_queue *queue)
 {
     mp_mutex_lock(&queue->lock);
+    queue->diag_locked_by = mp_thread_current_id();
     mp_assert(queue->locked);
     // Must be called after a mp_dispatch_lock(), from the same thread.
     mp_assert(queue->locked_explicit);
@@ -413,5 +450,6 @@ void mp_dispatch_unlock(struct mp_dispatch_queue *queue)
     // Wakeup mp_dispatch_queue_process(), and maybe other mp_dispatch_lock()s.
     // (Would be nice to wake up only 1 other locker if lock_requests>0.)
     mp_cond_broadcast(&queue->cond);
+    queue->diag_locked_by = 0;
     mp_mutex_unlock(&queue->lock);
 }
