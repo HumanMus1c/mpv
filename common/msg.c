@@ -123,6 +123,12 @@ struct mp_log_buffer {
     void (*wakeup_cb)(void *ctx);
     void *wakeup_cb_ctx;
     int level;
+    // A dedicated write thread (log_file_thread) consumes this buffer. Only
+    // buffers with a drainer may block their writers when full; buffers
+    // without one (e.g. the early filebuffer, which is documented as
+    // non-blocking) must never block, or a full buffer wedges the global log
+    // lock and with it every mpv thread.
+    bool has_drainer;
 };
 
 static const struct mp_log null_log = {0};
@@ -453,7 +459,16 @@ static void write_msg_to_buffers(struct mp_log *log, int lev, bstr text)
         if (buffer_level == MP_LOG_BUFFER_MSGL_LOGFILE)
             buffer_level = MPMAX(log->terminal_level, MSGL_DEBUG);
         if (lev <= buffer_level && lev != MSGL_STATUS) {
-            if (buffer->level == MP_LOG_BUFFER_MSGL_LOGFILE) {
+            // Blocking on a full buffer is only allowed if this buffer
+            // actually has a consumer. The early filebuffer has none (by
+            // design it is non-blocking), and the drainer check must look at
+            // this buffer rather than at the global write-thread state:
+            // otherwise a full early filebuffer coexisting with a running
+            // write thread blocks the writer forever while it holds the
+            // global log lock, deadlocking logging for the whole process.
+            if (buffer->level == MP_LOG_BUFFER_MSGL_LOGFILE &&
+                buffer->has_drainer)
+            {
                 // If the buffer is full, block until we can write again,
                 // unless there's no write thread (died, or early filebuffer)
                 bool dead = false;
@@ -917,6 +932,7 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
                 root->log_file_buffer =
                     mp_msg_log_buffer_new(global, FILE_BUF, MP_LOG_BUFFER_MSGL_LOGFILE,
                                           wakeup_log_file, root);
+                root->log_file_buffer->has_drainer = true;
                 root->log_file_thread_active = true;
                 if (mp_thread_create(&root->log_file_thread, log_file_thread,
                                    root))
